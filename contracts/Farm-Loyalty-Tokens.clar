@@ -19,12 +19,27 @@
 (define-constant ERR-ALREADY-PARTICIPATING (err u113))
 (define-constant ERR-EVENT-NOT-ACTIVE (err u114))
 (define-constant ERR-ACHIEVEMENT-NOT-UNLOCKED (err u115))
+(define-constant ERR-STAKE-NOT-FOUND (err u116))
+(define-constant ERR-STAKE-LOCKED (err u117))
+(define-constant ERR-INVALID-STAKE-TIER (err u118))
+(define-constant ERR-INSUFFICIENT-STAKE-BALANCE (err u119))
+(define-constant ERR-STAKE-ALREADY-WITHDRAWN (err u120))
 
 (define-constant CHALLENGE-DURATION u1440)
 (define-constant SEASONAL-EVENT-DURATION u10080)
 (define-constant MIN-PARTICIPANTS u3)
 (define-constant MAX-CHALLENGE-REWARD u1000)
 (define-constant COMMUNITY-BONUS-MULTIPLIER u150)
+(define-constant STAKE-TIER-BASIC u1)
+(define-constant STAKE-TIER-SILVER u2)
+(define-constant STAKE-TIER-GOLD u3)
+(define-constant STAKE-APR-BASIC u500)
+(define-constant STAKE-APR-SILVER u1000)
+(define-constant STAKE-APR-GOLD u1500)
+(define-constant STAKE-DURATION-BASIC u1440)
+(define-constant STAKE-DURATION-SILVER u4320)
+(define-constant STAKE-DURATION-GOLD u8640)
+(define-constant EARLY-WITHDRAWAL-PENALTY u2000)
 
 (define-data-var next-farm-id uint u1)
 (define-data-var next-produce-id uint u1)
@@ -35,6 +50,8 @@
 (define-data-var next-event-id uint u1)
 (define-data-var active-seasonal-event uint u0)
 (define-data-var total-community-points uint u0)
+(define-data-var next-stake-id uint u1)
+(define-data-var total-staked-tokens uint u0)
 
 (define-map farms 
   { farm-id: uint } 
@@ -172,6 +189,35 @@
     unlocked-at: uint,
     reward-claimed: bool
   }
+)
+
+(define-map token-stakes
+  { stake-id: uint }
+  {
+    staker: principal,
+    amount: uint,
+    tier: uint,
+    start-block: uint,
+    unlock-block: uint,
+    apr-rate: uint,
+    withdrawn: bool,
+    rewards-claimed: uint
+  }
+)
+
+(define-map user-stake-info
+  { user: principal }
+  {
+    total-staked: uint,
+    active-stakes: uint,
+    total-rewards-earned: uint,
+    stake-count: uint
+  }
+)
+
+(define-map user-stakes-list
+  { user: principal, index: uint }
+  { stake-id: uint }
 )
 
 (define-public (create-community-challenge
@@ -757,3 +803,189 @@
 
 (define-read-only (get-next-visit-id)
   (var-get next-visit-id))
+
+(define-read-only (get-stake-info (stake-id uint))
+  (map-get? token-stakes { stake-id: stake-id }))
+
+(define-read-only (get-user-stake-info (user principal))
+  (default-to 
+    { total-staked: u0, active-stakes: u0, total-rewards-earned: u0, stake-count: u0 }
+    (map-get? user-stake-info { user: user })))
+
+(define-read-only (get-user-stake-by-index (user principal) (index uint))
+  (match (map-get? user-stakes-list { user: user, index: index })
+    entry (map-get? token-stakes { stake-id: (get stake-id entry) })
+    none))
+
+(define-read-only (calculate-stake-rewards (stake-id uint))
+  (match (map-get? token-stakes { stake-id: stake-id })
+    stake-data
+    (let 
+      (
+        (blocks-elapsed (- stacks-block-height (get start-block stake-data)))
+        (amount (get amount stake-data))
+        (apr (get apr-rate stake-data))
+        (rewards (/ (* (* amount apr) blocks-elapsed) (* u10000 u52560)))
+      )
+      (ok rewards))
+    (err ERR-STAKE-NOT-FOUND)))
+
+(define-read-only (get-stake-tier-info (tier uint))
+  (if (is-eq tier STAKE-TIER-BASIC)
+    (ok { 
+      tier: STAKE-TIER-BASIC, 
+      apr: STAKE-APR-BASIC, 
+      duration: STAKE-DURATION-BASIC,
+      name: "Basic"
+    })
+    (if (is-eq tier STAKE-TIER-SILVER)
+      (ok { 
+        tier: STAKE-TIER-SILVER, 
+        apr: STAKE-APR-SILVER, 
+        duration: STAKE-DURATION-SILVER,
+        name: "Silver"
+      })
+      (if (is-eq tier STAKE-TIER-GOLD)
+        (ok { 
+          tier: STAKE-TIER-GOLD, 
+          apr: STAKE-APR-GOLD, 
+          duration: STAKE-DURATION-GOLD,
+          name: "Gold"
+        })
+        (err ERR-INVALID-STAKE-TIER)))))
+
+(define-read-only (get-total-staked)
+  (ok (var-get total-staked-tokens)))
+
+(define-public (stake-tokens (amount uint) (tier uint))
+  (let 
+    (
+      (stake-id (var-get next-stake-id))
+      (user-tokens-data (default-to { balance: u0, total-earned: u0, total-spent: u0 } (map-get? user-tokens { user: tx-sender })))
+      (user-stake-data (default-to { total-staked: u0, active-stakes: u0, total-rewards-earned: u0, stake-count: u0 } (map-get? user-stake-info { user: tx-sender })))
+      (tier-info (unwrap! (get-stake-tier-info tier) ERR-INVALID-STAKE-TIER))
+      (duration (get duration tier-info))
+      (apr (get apr tier-info))
+    )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= (get balance user-tokens-data) amount) ERR-INSUFFICIENT-STAKE-BALANCE)
+    
+    (try! (ft-burn? loyalty-token amount tx-sender))
+    
+    (map-set token-stakes
+      { stake-id: stake-id }
+      {
+        staker: tx-sender,
+        amount: amount,
+        tier: tier,
+        start-block: stacks-block-height,
+        unlock-block: (+ stacks-block-height duration),
+        apr-rate: apr,
+        withdrawn: false,
+        rewards-claimed: u0
+      })
+    
+    (map-set user-stakes-list
+      { user: tx-sender, index: (get stake-count user-stake-data) }
+      { stake-id: stake-id })
+    
+    (map-set user-stake-info
+      { user: tx-sender }
+      {
+        total-staked: (+ (get total-staked user-stake-data) amount),
+        active-stakes: (+ (get active-stakes user-stake-data) u1),
+        total-rewards-earned: (get total-rewards-earned user-stake-data),
+        stake-count: (+ (get stake-count user-stake-data) u1)
+      })
+    
+    (map-set user-tokens
+      { user: tx-sender }
+      {
+        balance: (- (get balance user-tokens-data) amount),
+        total-earned: (get total-earned user-tokens-data),
+        total-spent: (+ (get total-spent user-tokens-data) amount)
+      })
+    
+    (var-set next-stake-id (+ stake-id u1))
+    (var-set total-staked-tokens (+ (var-get total-staked-tokens) amount))
+    (ok stake-id)
+  )
+)
+
+(define-public (claim-stake-rewards (stake-id uint))
+  (let 
+    (
+      (stake-data (unwrap! (map-get? token-stakes { stake-id: stake-id }) ERR-STAKE-NOT-FOUND))
+      (user-tokens-data (default-to { balance: u0, total-earned: u0, total-spent: u0 } (map-get? user-tokens { user: tx-sender })))
+      (user-stake-data (unwrap! (map-get? user-stake-info { user: tx-sender }) ERR-STAKE-NOT-FOUND))
+      (rewards (unwrap! (calculate-stake-rewards stake-id) ERR-STAKE-NOT-FOUND))
+    )
+    (asserts! (is-eq (get staker stake-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get withdrawn stake-data)) ERR-STAKE-ALREADY-WITHDRAWN)
+    (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
+    
+    (try! (ft-mint? loyalty-token rewards tx-sender))
+    
+    (map-set token-stakes
+      { stake-id: stake-id }
+      (merge stake-data { rewards-claimed: (+ (get rewards-claimed stake-data) rewards) }))
+    
+    (map-set user-stake-info
+      { user: tx-sender }
+      (merge user-stake-data { total-rewards-earned: (+ (get total-rewards-earned user-stake-data) rewards) }))
+    
+    (map-set user-tokens
+      { user: tx-sender }
+      {
+        balance: (+ (get balance user-tokens-data) rewards),
+        total-earned: (+ (get total-earned user-tokens-data) rewards),
+        total-spent: (get total-spent user-tokens-data)
+      })
+    
+    (ok rewards)
+  )
+)
+
+(define-public (unstake-tokens (stake-id uint))
+  (let 
+    (
+      (stake-data (unwrap! (map-get? token-stakes { stake-id: stake-id }) ERR-STAKE-NOT-FOUND))
+      (user-tokens-data (default-to { balance: u0, total-earned: u0, total-spent: u0 } (map-get? user-tokens { user: tx-sender })))
+      (user-stake-data (unwrap! (map-get? user-stake-info { user: tx-sender }) ERR-STAKE-NOT-FOUND))
+      (is-unlocked (>= stacks-block-height (get unlock-block stake-data)))
+      (amount (get amount stake-data))
+      (penalty (if is-unlocked u0 (/ (* amount EARLY-WITHDRAWAL-PENALTY) u10000)))
+      (return-amount (- amount penalty))
+    )
+    (asserts! (is-eq (get staker stake-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get withdrawn stake-data)) ERR-STAKE-ALREADY-WITHDRAWN)
+    
+    (try! (claim-stake-rewards stake-id))
+    
+    (try! (ft-mint? loyalty-token return-amount tx-sender))
+    
+    (map-set token-stakes
+      { stake-id: stake-id }
+      (merge stake-data { withdrawn: true }))
+    
+    (map-set user-stake-info
+      { user: tx-sender }
+      {
+        total-staked: (- (get total-staked user-stake-data) amount),
+        active-stakes: (- (get active-stakes user-stake-data) u1),
+        total-rewards-earned: (get total-rewards-earned user-stake-data),
+        stake-count: (get stake-count user-stake-data)
+      })
+    
+    (map-set user-tokens
+      { user: tx-sender }
+      {
+        balance: (+ (get balance user-tokens-data) return-amount),
+        total-earned: (get total-earned user-tokens-data),
+        total-spent: (- (get total-spent user-tokens-data) return-amount)
+      })
+    
+    (var-set total-staked-tokens (- (var-get total-staked-tokens) amount))
+    (ok { returned: return-amount, penalty: penalty })
+  )
+)
