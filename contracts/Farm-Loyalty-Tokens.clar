@@ -24,6 +24,9 @@
 (define-constant ERR-INVALID-STAKE-TIER (err u118))
 (define-constant ERR-INSUFFICIENT-STAKE-BALANCE (err u119))
 (define-constant ERR-STAKE-ALREADY-WITHDRAWN (err u120))
+(define-constant ERR-CANNOT-GIFT-SELF (err u121))
+(define-constant ERR-GIFT-NOT-FOUND (err u122))
+(define-constant MAX-GIFT-MESSAGE-LEN u100)
 
 (define-constant CHALLENGE-DURATION u1440)
 (define-constant SEASONAL-EVENT-DURATION u10080)
@@ -52,6 +55,8 @@
 (define-data-var total-community-points uint u0)
 (define-data-var next-stake-id uint u1)
 (define-data-var total-staked-tokens uint u0)
+(define-data-var next-gift-id uint u1)
+(define-data-var total-gifts-sent uint u0)
 
 (define-map farms 
   { farm-id: uint } 
@@ -218,6 +223,27 @@
 (define-map user-stakes-list
   { user: principal, index: uint }
   { stake-id: uint }
+)
+
+(define-map token-gifts
+  { gift-id: uint }
+  {
+    sender: principal,
+    recipient: principal,
+    amount: uint,
+    message: (string-ascii 100),
+    timestamp: uint
+  }
+)
+
+(define-map user-gifts-sent
+  { user: principal }
+  { count: uint, total-amount: uint }
+)
+
+(define-map user-gifts-received
+  { user: principal }
+  { count: uint, total-amount: uint }
 )
 
 (define-public (create-community-challenge
@@ -857,6 +883,62 @@
 (define-read-only (get-total-staked)
   (ok (var-get total-staked-tokens)))
 
+(define-public (gift-tokens (recipient principal) (amount uint) (message (string-ascii 100)))
+  (let 
+    (
+      (gift-id (var-get next-gift-id))
+      (sender-tokens (default-to { balance: u0, total-earned: u0, total-spent: u0 } (map-get? user-tokens { user: tx-sender })))
+      (recipient-tokens (default-to { balance: u0, total-earned: u0, total-spent: u0 } (map-get? user-tokens { user: recipient })))
+      (sender-gifts (default-to { count: u0, total-amount: u0 } (map-get? user-gifts-sent { user: tx-sender })))
+      (recipient-gifts (default-to { count: u0, total-amount: u0 } (map-get? user-gifts-received { user: recipient })))
+    )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-eq tx-sender recipient)) ERR-CANNOT-GIFT-SELF)
+    (asserts! (>= (get balance sender-tokens) amount) ERR-INSUFFICIENT-TOKENS)
+
+    (try! (ft-burn? loyalty-token amount tx-sender))
+    (try! (ft-mint? loyalty-token amount recipient))
+
+    (map-set token-gifts
+      { gift-id: gift-id }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        message: message,
+        timestamp: stacks-block-height
+      })
+
+    (map-set user-tokens
+      { user: tx-sender }
+      {
+        balance: (- (get balance sender-tokens) amount),
+        total-earned: (get total-earned sender-tokens),
+        total-spent: (+ (get total-spent sender-tokens) amount)
+      })
+
+    (map-set user-tokens
+      { user: recipient }
+      {
+        balance: (+ (get balance recipient-tokens) amount),
+        total-earned: (+ (get total-earned recipient-tokens) amount),
+        total-spent: (get total-spent recipient-tokens)
+      })
+
+    (map-set user-gifts-sent
+      { user: tx-sender }
+      { count: (+ (get count sender-gifts) u1), total-amount: (+ (get total-amount sender-gifts) amount) })
+
+    (map-set user-gifts-received
+      { user: recipient }
+      { count: (+ (get count recipient-gifts) u1), total-amount: (+ (get total-amount recipient-gifts) amount) })
+
+    (var-set next-gift-id (+ gift-id u1))
+    (var-set total-gifts-sent (+ (var-get total-gifts-sent) u1))
+    (ok gift-id)
+  )
+)
+
 (define-public (stake-tokens (amount uint) (tier uint))
   (let 
     (
@@ -989,3 +1071,18 @@
     (ok { returned: return-amount, penalty: penalty })
   )
 )
+
+(define-read-only (get-gift-info (gift-id uint))
+  (map-get? token-gifts { gift-id: gift-id }))
+
+(define-read-only (get-user-gifts-sent-info (user principal))
+  (default-to { count: u0, total-amount: u0 } (map-get? user-gifts-sent { user: user })))
+
+(define-read-only (get-user-gifts-received-info (user principal))
+  (default-to { count: u0, total-amount: u0 } (map-get? user-gifts-received { user: user })))
+
+(define-read-only (get-gifting-stats)
+  (ok {
+    total-gifts-sent: (var-get total-gifts-sent),
+    next-gift-id: (var-get next-gift-id)
+  }))
